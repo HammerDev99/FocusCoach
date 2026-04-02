@@ -28,3 +28,5 @@ Thumbs.db
 # Temp files
 *.tmp
 *.bak
+test_mistral_ocr.py
+test_ocr_output.json
