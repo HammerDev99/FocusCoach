@@ -15,6 +15,13 @@ from pathlib import Path
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
+from focuscoachdisc_openai import (
+    ResponsesChat,
+    build_document_context,
+    clean_streaming_text,
+    friendly_error_message,
+    load_profile,
+)
 import uuid
 import streamlit.components.v1 as components
 
@@ -113,12 +120,11 @@ APP_IDENTITY = {
     """,
     # Mensajes de error y configuracion
     "api_key_missing": "Por favor, proporciona una clave API para continuar.",
-    "assistant_id_missing": "Por favor, proporciona el ID del asistente de OpenAI.",
-    "thread_created": "ID del hilo: ",
+    "conversation_started": "Sistema experto inicializado correctamente",
     "response_error": "No se pudo obtener respuesta. Por favor, intente de nuevo.",
     "config_success": "Configuracion completa",
     "config_warning": "Falta configurar: {missing_items}",
-    "config_needed": "**Configuracion incompleta**: {app_name} necesita que configures las claves API y el ID del asistente en el archivo `.streamlit/secrets.toml` o como variables de entorno.",
+    "config_needed": "❌ **Configuración incompleta**: {app_name} necesita que configures `OPENAI_API_KEY` y `MISTRAL_API_KEY` en el archivo `.streamlit/secrets.toml` o como variables de entorno.",
     # Configuracion del menu
     "menu_items": {
         "Get Help": "https://github.com/HammerDev99/FocusCoachDisc",
@@ -311,24 +317,42 @@ def is_streamlit_cloud():
         return False
 
 
-# Crear cliente OpenAI para Assistants
-@handle_error(max_retries=1)
+# Lectura unificada de configuración: variables de entorno primero, luego secrets.toml
+def get_setting(name, default=None):
+    """
+    Obtiene un valor de configuración desde variables de entorno o st.secrets.
+    """
+    value = os.environ.get(name)
+    if value not in (None, ""):
+        return value
+    try:
+        if hasattr(st, "secrets") and name in st.secrets:
+            return st.secrets[name]
+    except Exception as e:  # secrets.toml ausente o ilegible
+        logging.debug(f"No se pudo leer st.secrets[{name}]: {str(e)}")
+    return default
+
+
+# Crear cliente OpenAI (Responses API). Se cachea por API Key para no
+# reconstruirlo ni verificar conectividad en cada rerun de Streamlit.
+@st.cache_resource(show_spinner=False)
+def _build_openai_client(api_key):
+    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=2)
+    # Verificar credenciales con una llamada liviana
+    client.models.list()
+    logging.info("Cliente OpenAI inicializado correctamente")
+    return client
+
+
 def create_openai_client(api_key):
     """
-    Crea un cliente OpenAI con encabezados compatibles con Assistants API v2
+    Devuelve un cliente OpenAI verificado o None si no fue posible conectar.
     """
     try:
-        client = OpenAI(
-            api_key=api_key, default_headers={"OpenAI-Beta": "assistants=v2"}
-        )
-        models = client.models.list()
-        if not models:
-            raise Exception("No se pudo obtener la lista de modelos")
-        logging.info("Cliente OpenAI inicializado correctamente")
-        return client
+        return _build_openai_client(api_key)
     except Exception as e:
         logging.error(f"Error inicializando cliente OpenAI: {str(e)}")
-        st.error(f"No se pudo conectar a OpenAI: {str(e)}")
+        st.error(f"No se pudo conectar a OpenAI: {friendly_error_message(e)}")
         return None
 
 
@@ -806,183 +830,107 @@ def manage_document_context():
         st.info("No hay documentos cargados en el contexto actual.")
 
 
-# Funciones de OpenAI Assistants
-@handle_error(max_retries=1)
-def initialize_thread(client):
-    """Inicializa un nuevo thread de conversacion"""
-    try:
-        thread = client.beta.threads.create()
-        thread_id = thread.id
-        logging.info(f"Thread creado: {thread_id}")
-        test_thread = client.beta.threads.retrieve(thread_id=thread_id)
-        if not test_thread or not hasattr(test_thread, "id"):
-            raise Exception("El thread se creo pero no se puede recuperar")
-        return thread_id
-    except Exception as e:
-        logging.error(f"Error creando thread: {str(e)}")
-        st.error("No se pudo inicializar la conversacion con el asistente")
-        return None
+# Perfil del asistente (reemplaza al objeto Assistant que vivía en OpenAI)
+@st.cache_resource(show_spinner=False)
+def build_assistant_profile():
+    """
+    Construye la configuración del asistente desde env/secrets:
+    OPENAI_MODEL, ASSISTANT_INSTRUCTIONS, VECTOR_STORE_ID, OPENAI_TEMPERATURE, etc.
+    """
+    profile = load_profile(get_setting, name=APP_IDENTITY["name"])
+    logging.info(
+        f"Perfil del asistente: modelo={profile.model}, "
+        f"base_conocimiento={'sí' if profile.has_knowledge_base else 'no'}, "
+        f"historial_max={profile.max_history_messages}"
+    )
+    return profile
 
 
-@handle_error(max_retries=1)
-def process_message_with_citations(message):
-    """Extrae y formatea el texto del mensaje del asistente con citas"""
-    try:
-        if not hasattr(message, "content") or not message.content:
-            return "No se pudo procesar el mensaje"
-
-        processed_content = ""
-        for content_item in message.content:
-            if hasattr(content_item, "text") and content_item.text:
-                text_value = content_item.text.value
-                annotations = []
-
-                if hasattr(content_item.text, "annotations") and content_item.text.annotations:
-                    annotations = content_item.text.annotations
-
-                    if annotations:
-                        citations = []
-                        for idx, annotation in enumerate(annotations):
-                            text_value = text_value.replace(annotation.text, f"[{idx+1}]")
-                            if file_citation := getattr(annotation, "file_citation", None):
-                                file_id = file_citation.file_id
-                                file_name = "Documento de referencia"
-                                if "file_metadata" in st.session_state and file_id in st.session_state.file_metadata:
-                                    file_name = st.session_state.file_metadata[file_id]["name"]
-                                citations.append(f"[{idx+1}] Fuente: {file_name}")
-
-                        if citations:
-                            text_value += "\n\n--- Referencias: ---\n" + "\n".join(citations)
-
-                processed_content += text_value
-            else:
-                processed_content += str(content_item)
-
-        return processed_content
-    except Exception as e:
-        logging.error(f"Error procesando mensaje: {str(e)}")
-        return "Error al procesar la respuesta del asistente"
+# Inicializar la conversación local (sustituye a client.beta.threads.create)
+def initialize_conversation():
+    """
+    Crea un identificador local de conversación. El historial se guarda en
+    st.session_state.api_history y se envía completo en cada llamada.
+    """
+    conversation_id = f"focuscoachdisc-{uuid.uuid4().hex}"
+    logging.info(f"Conversación local creada: {conversation_id}")
+    return conversation_id
 
 
-@handle_error(max_retries=1)
-def send_message_with_document_context(client, thread_id, assistant_id, prompt, current_doc_contents=None):
-    """Envia un mensaje al asistente incluyendo el contexto de documentos"""
-    try:
-        full_prompt = prompt
-        all_doc_contents = {}
+def _session_file_names():
+    """Mapa file_id -> nombre, para citas de file_search (compatibilidad)."""
+    metadata = st.session_state.get("file_metadata") or {}
+    names = {}
+    for file_id, meta in metadata.items():
+        if isinstance(meta, dict) and meta.get("name"):
+            names[file_id] = meta["name"]
+    return names
 
-        if "document_contents" in st.session_state:
-            all_doc_contents.update(st.session_state.document_contents)
 
-        if current_doc_contents and isinstance(current_doc_contents, dict):
-            all_doc_contents.update(current_doc_contents)
-            if "document_contents" not in st.session_state:
-                st.session_state.document_contents = {}
-            st.session_state.document_contents.update(current_doc_contents)
+# Función para generar la respuesta del asistente con contexto de documentos
+def generate_assistant_reply(client, profile, user_text):
+    """
+    Envía el turno a la Responses API con el historial de la sesión y el
+    contexto de documentos, mostrando la respuesta en streaming.
 
-        if all_doc_contents and len(all_doc_contents) > 0:
-            document_context = "\n\n### Contexto de documentos procesados:\n\n"
-            for doc_name, doc_content in all_doc_contents.items():
-                if isinstance(doc_content, dict):
-                    if "text" in doc_content:
-                        doc_text = doc_content["text"][:5000] + "..." if len(doc_content["text"]) > 5000 else doc_content["text"]
-                        document_context += f"-- Documento: {doc_name} --\n{doc_text}\n\n"
-                    elif "error" in doc_content and "raw_response" in doc_content:
-                        raw_response = doc_content["raw_response"]
-                        if isinstance(raw_response, dict) and "text" in raw_response:
-                            doc_text = raw_response["text"][:5000] + "..." if len(raw_response["text"]) > 5000 else raw_response["text"]
-                            document_context += f"-- Documento: {doc_name} --\n{doc_text}\n\n"
-                        else:
-                            document_context += f"-- Documento: {doc_name} -- (Error al extraer texto: {doc_content['error']})\n\n"
-                    else:
-                        document_context += f"-- Documento: {doc_name} -- (No se pudo extraer texto)\n\n"
+    Devuelve un dict {"role": "assistant", "content": ..., "id": ...} o None.
+    """
+    chat = ResponsesChat(client, profile)
+    history = st.session_state.get("api_history", [])
+    document_context = build_document_context(
+        st.session_state.get("document_contents", {}), profile.max_doc_chars
+    )
+    if document_context:
+        logging.info(
+            f"Contexto con {len(st.session_state.document_contents)} documentos. "
+            f"Tamaño: {len(document_context)} caracteres"
+        )
 
-            if len(document_context) > 60:
-                full_prompt = f"{prompt}\n\n{document_context}"
-                logging.info(f"Prompt enriquecido con contexto de {len(all_doc_contents)} documentos. Tamano total: {len(full_prompt)} caracteres")
+    with st.chat_message("assistant"):
+        status = st.status(
+            "Analizando consulta y procesando información...", expanded=False
+        )
+        placeholder = st.empty()
+        streamed = []
 
-        # Crear mensaje
-        message = None
-        for attempt in range(2):
-            try:
-                message = client.beta.threads.messages.create(thread_id=thread_id, role="user", content=full_prompt)
-                break
-            except Exception as e:
-                if attempt == 0:
-                    logging.warning(f"Error al crear mensaje (intento 1): {str(e)}. Reintentando...")
-                    time.sleep(2)
-                else:
-                    raise Exception(f"Error al crear mensaje: {str(e)}")
+        def on_status(label):
+            status.update(label=label, state="running")
 
-        if not message:
-            raise Exception("No se pudo crear el mensaje despues de reintentos")
+        try:
+            for delta in chat.stream_reply(
+                history,
+                user_text,
+                document_context=document_context,
+                cache_key=st.session_state.get("conversation_id"),
+                on_status=on_status,
+                file_names=_session_file_names(),
+            ):
+                streamed.append(delta)
+                placeholder.markdown(clean_streaming_text("".join(streamed)) + "▌")
+            reply = chat.last_reply
+        except Exception as e:
+            logging.error(f"Error en comunicación con OpenAI: {str(e)}")
+            logging.error(traceback.format_exc())
+            status.update(label="Error en el procesamiento", state="error")
+            placeholder.empty()
+            st.error(friendly_error_message(e))
+            return None
 
-        # Crear ejecucion
-        run = None
-        for attempt in range(2):
-            try:
-                run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=assistant_id)
-                break
-            except Exception as e:
-                if attempt == 0:
-                    logging.warning(f"Error al crear ejecucion (intento 1): {str(e)}. Reintentando...")
-                    time.sleep(2)
-                else:
-                    raise Exception(f"Error al crear ejecucion: {str(e)}")
+        if reply is None or not reply.content.strip():
+            status.update(label="Sin respuesta del modelo", state="error")
+            placeholder.empty()
+            st.error(APP_IDENTITY["response_error"])
+            return None
 
-        if not run:
-            raise Exception("No se pudo iniciar la ejecucion despues de reintentos")
+        status.update(label="Análisis completado", state="complete")
+        placeholder.markdown(reply.content)
 
-        # Esperar completacion
-        with st.status("Analizando tu consulta y preparando coaching personalizado...", expanded=True) as status:
-            max_run_time = 120
-            start_time = time.time()
+    # Historial para la API: texto limpio, sin marcadores ni referencias
+    st.session_state.api_history.append({"role": "user", "content": user_text})
+    st.session_state.api_history.append({"role": "assistant", "content": reply.text})
+    st.session_state.last_response_id = reply.response_id
 
-            while run.status not in ["completed", "failed", "cancelled", "expired"]:
-                time.sleep(1)
-                elapsed_time = time.time() - start_time
-                if elapsed_time > max_run_time:
-                    status.update(label="La operacion esta tomando demasiado tiempo. Intente nuevamente.", state="error")
-                    return None
-
-                try:
-                    run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-                except Exception:
-                    pass
-
-                if run.status == "in_progress":
-                    status.update(label="Procesando tu consulta con coaching DISC personalizado...", state="running")
-                elif run.status == "requires_action":
-                    status.update(label="Realizando acciones requeridas...", state="running")
-
-                if run.status == "failed":
-                    status.update(label="Error en el procesamiento", state="error")
-                    return None
-
-            if run.status == "completed":
-                status.update(label="Coaching completado", state="complete")
-
-        # Recuperar mensajes
-        if run.status == "completed":
-            try:
-                messages = client.beta.threads.messages.list(thread_id=thread_id)
-                for message in messages.data:
-                    if message.role == "assistant" and not any(
-                        msg["role"] == "assistant" and msg.get("id") == message.id
-                        for msg in st.session_state.messages
-                    ):
-                        full_response = process_message_with_citations(message)
-                        return {"role": "assistant", "content": full_response, "id": message.id}
-                return None
-            except Exception as e:
-                logging.error(f"Error al recuperar mensajes: {str(e)}")
-                return None
-
-        return None
-    except Exception as e:
-        logging.error(f"Error en comunicacion con OpenAI: {str(e)}")
-        st.error("Ocurrio un error al comunicarse con el asistente. Por favor, intente nuevamente.")
-        return None
+    return {"role": "assistant", "content": reply.content, "id": reply.response_id}
 
 
 # Funcion para limpiar la sesion actual
@@ -1001,6 +949,8 @@ def clean_current_session():
             st.session_state.uploaded_files = []
         if "messages" in st.session_state:
             st.session_state.messages = []
+        st.session_state.api_history = []
+        st.session_state.last_response_id = None
         for key in ["file_metadata"]:
             if key in st.session_state:
                 st.session_state[key] = {}
@@ -1021,29 +971,28 @@ st.title(f"{APP_IDENTITY['name']} {APP_IDENTITY['icon']} {APP_IDENTITY['tagline'
 with st.sidebar:
     st.title(f"{APP_IDENTITY['icon']} Configuracion y Recursos")
 
-    # Obtener API Key de OpenAI
-    openai_api_key = os.environ.get("OPENAI_API_KEY")
-    if not openai_api_key and hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
-        openai_api_key = st.secrets["OPENAI_API_KEY"]
+    # Obtener API Key de OpenAI (env -> secrets.toml -> usuario)
+    openai_api_key = get_setting("OPENAI_API_KEY")
     if not openai_api_key:
-        openai_api_key = st.text_input("API Key de OpenAI", type="password", help="Ingrese su API Key de OpenAI")
+        openai_api_key = st.text_input(
+            "API Key de OpenAI", type="password", help="Ingrese su API Key de OpenAI"
+        )
 
-    # Obtener API Key de Mistral
-    mistral_api_key = os.environ.get("MISTRAL_API_KEY")
-    if not mistral_api_key and hasattr(st, "secrets") and "MISTRAL_API_KEY" in st.secrets:
-        mistral_api_key = st.secrets["MISTRAL_API_KEY"]
+    # Obtener API Key de Mistral (env -> secrets.toml -> usuario)
+    mistral_api_key = get_setting("MISTRAL_API_KEY")
     if not mistral_api_key:
-        mistral_api_key = st.text_input("API Key de Mistral", type="password", help="Ingrese su API Key de Mistral para OCR")
+        mistral_api_key = st.text_input(
+            "API Key de Mistral",
+            type="password",
+            help="Ingrese su API Key de Mistral para OCR",
+        )
 
-    # Obtener Assistant ID
-    assistant_id = os.environ.get("ASSISTANT_ID")
-    if not assistant_id and hasattr(st, "secrets") and "ASSISTANT_ID" in st.secrets:
-        assistant_id = st.secrets["ASSISTANT_ID"]
-    if not assistant_id:
-        assistant_id = st.text_input("ID del Asistente", type="password", help="Ingrese el ID del asistente de OpenAI")
+    # Perfil del asistente: modelo, instrucciones y base de conocimiento.
+    # Ya no se requiere ASSISTANT_ID: la configuración vive en el código/secrets.
+    assistant_profile = build_assistant_profile()
 
-    # Verificar configuracion
-    if openai_api_key and mistral_api_key and assistant_id:
+    # Verificar configuración
+    if openai_api_key and mistral_api_key:
         st.success(APP_IDENTITY["config_success"])
     else:
         missing = []
@@ -1051,9 +1000,14 @@ with st.sidebar:
             missing.append("API Key de OpenAI")
         if not mistral_api_key:
             missing.append("API Key de Mistral")
-        if not assistant_id:
-            missing.append("ID del Asistente")
-        st.warning(APP_IDENTITY["config_warning"].format(missing_items=", ".join(missing)))
+        st.warning(
+            APP_IDENTITY["config_warning"].format(missing_items=", ".join(missing))
+        )
+
+    st.caption(
+        f"Modelo: `{assistant_profile.model}` · Base de conocimiento: "
+        f"{'activa' if assistant_profile.has_knowledge_base else 'no configurada'}"
+    )
 
     env_type = "Streamlit Cloud" if is_streamlit_cloud() else "Local"
     st.info(f"Entorno detectado: {env_type}")
@@ -1149,14 +1103,21 @@ with st.sidebar:
     )
 
 # Detener si no hay configuracion completa
-if not openai_api_key or not mistral_api_key or not assistant_id:
+if not openai_api_key or not mistral_api_key:
     st.markdown(APP_IDENTITY["config_needed"].format(app_name=APP_IDENTITY["name"]))
     st.stop()
 
 # ----- INICIALIZACION DE ESTADO -----
 
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = None
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = None
+
+# Historial que se envía a la Responses API (solo texto user/assistant)
+if "api_history" not in st.session_state:
+    st.session_state.api_history = []
+
+if "last_response_id" not in st.session_state:
+    st.session_state.last_response_id = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "uploaded_files" not in st.session_state:
@@ -1177,16 +1138,15 @@ if "feedback_reminded" not in st.session_state:
 # Crear clientes
 openai_client = create_openai_client(openai_api_key)
 
-# Inicializar thread
-if not st.session_state.thread_id and openai_client:
-    with st.spinner("Inicializando coach DISC..."):
-        thread_id = initialize_thread(openai_client)
-        if thread_id:
-            st.session_state.thread_id = thread_id
-            st.success(f"{APP_IDENTITY['icon']} Coach DISC inicializado correctamente {APP_IDENTITY['icon']}")
+# Inicializar conversación local si no existe (ya no hay threads en OpenAI)
+if not st.session_state.conversation_id and openai_client:
+    st.session_state.conversation_id = initialize_conversation()
+    st.success(
+        f"{APP_IDENTITY['icon']} {APP_IDENTITY['conversation_started']} {APP_IDENTITY['icon']}"
+    )
 
 # Mostrar feedback dialog
-if (st.session_state.thread_id
+if (st.session_state.conversation_id
     and not st.session_state.feedback_dismissed
     and not st.session_state.feedback_reminded):
 
@@ -1226,15 +1186,17 @@ if prompt:
     user_text = ""
     user_files = []
 
-    if hasattr(prompt, "text"):
-        user_text = prompt.text
+    if isinstance(prompt, str):
+
+        user_text = prompt
+
+    elif hasattr(prompt, "text"):
+
+        user_text = prompt.text or ""
     if hasattr(prompt, "files") and prompt.files:
         user_files = prompt.files
     elif isinstance(prompt, dict) and "files" in prompt and prompt["files"]:
         user_files = prompt["files"]
-
-    current_doc_contents = {}
-
     # Procesar archivos con OCR
     if user_files:
         with st.spinner("Procesando documentos con OCR..."):
@@ -1259,7 +1221,6 @@ if prompt:
                     ocr_results = process_document_with_mistral_ocr(mistral_api_key, file_bytes, file_type, file.name)
 
                     if ocr_results and "error" not in ocr_results:
-                        current_doc_contents[file.name] = ocr_results
                         st.session_state.document_contents[file.name] = ocr_results
                         st.success(f"Documento {file.name} procesado correctamente")
                         valid_files += 1
@@ -1296,22 +1257,14 @@ if prompt:
         with st.chat_message("user"):
             st.markdown(display_message)
 
-        if st.session_state.thread_id and openai_client and assistant_id:
+        if st.session_state.conversation_id and openai_client:
             try:
-                response = send_message_with_document_context(
-                    openai_client,
-                    st.session_state.thread_id,
-                    assistant_id,
-                    user_text,
-                    current_doc_contents=current_doc_contents,
+                response = generate_assistant_reply(
+                    openai_client, assistant_profile, user_text
                 )
 
                 if response:
                     st.session_state.messages.append(response)
-                    with st.chat_message("assistant"):
-                        st.markdown(response["content"])
-                else:
-                    st.error("No se pudo obtener respuesta. Por favor, intente de nuevo.")
             except Exception as e:
                 st.error(f"Error al procesar la respuesta: {str(e)}")
                 logging.error(f"Error procesando respuesta: {traceback.format_exc()}")

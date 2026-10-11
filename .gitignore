@@ -30,3 +30,8 @@ Thumbs.db
 *.bak
 test_mistral_ocr.py
 test_ocr_output.json
+
+# Base de conocimiento: los documentos oficiales no se distribuyen en el repositorio
+knowledge/*
+!knowledge/README.md
+!knowledge/focuscoachdisc_base_conocimiento.md

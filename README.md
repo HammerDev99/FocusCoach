@@ -15,7 +15,7 @@ FocusCoach DISC es un asistente de coaching basado en la metodologia DISC que ay
 ## Stack Tecnologico
 
 - **Frontend**: Streamlit
-- **AI**: OpenAI Assistants API v2
+- **AI**: OpenAI Responses API
 - **OCR**: Mistral AI OCR
 - **Deployment**: Streamlit Cloud
 
@@ -34,7 +34,7 @@ Crear archivo `.streamlit/secrets.toml`:
 
 ```toml
 OPENAI_API_KEY = "sk-..."
-ASSISTANT_ID = "asst_..."
+VECTOR_STORE_ID = "vs_..."  # Opcional: base de conocimiento (file_search)
 MISTRAL_API_KEY = "..."  # Opcional, para OCR
 ANALYTICS_SCRIPT = '<script ...>'  # Opcional
 ```
